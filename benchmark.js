@@ -244,6 +244,150 @@ async function asyncStringify(obj, timeoutMs, yieldEveryMs = 5) {
   }
 }
 
+// Approach 3: Optimized async stringify
+async function asyncStringifyOptimized(obj, timeoutMs, yieldEveryMs = 5) {
+  const controller = new SimpleAbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  // Optimization 1: Use Date.now() instead of process.hrtime()
+  let lastYield = Date.now();
+  let operations = 0;
+  let bytesProcessed = 0;
+  const CHECK_INTERVAL = 1000; // Optimization 2: Check less frequently
+  const BATCH_SIZE = 50; // Process multiple array items at once
+
+  async function checkAndYield() {
+    operations++;
+
+    // Only check time periodically
+    if (operations % CHECK_INTERVAL === 0) {
+      const now = Date.now();
+
+      if (now - lastYield > yieldEveryMs) {
+        await new Promise(r => setImmediate(r));
+        lastYield = Date.now();
+        bytesProcessed = 0; // Reset byte counter after yield
+      }
+    }
+
+    if (controller.signal.aborted) {
+      throw new Error(`Async timeout after ${timeoutMs}ms`);
+    }
+  }
+
+  // Helper to check if object is safe for JSON.stringify
+  function isSafeObject(obj) {
+    if (obj === null || typeof obj !== 'object') return true;
+    if (Array.isArray(obj)) {
+      return obj.length < 10 && obj.every(isSafeObject);
+    }
+    const keys = Object.keys(obj);
+    if (keys.length > 20) return false;
+
+    return Object.values(obj).every(val => {
+      const type = typeof val;
+      return type === 'string' ? val.length < 1000 :
+             type === 'number' || type === 'boolean' || val === null;
+    });
+  }
+
+  // Optimized stringify with batching
+  async function stringify(value, visited = new WeakSet()) {
+    // Don't check for every value - only at strategic points
+    if (operations % 100 === 0) {
+      await checkAndYield();
+    }
+
+    if (value === null || value === undefined) return 'null';
+
+    const type = typeof value;
+
+    // Handle primitives
+    if (type !== 'object') {
+      operations++;
+      if (type === 'string') {
+        bytesProcessed += value.length;
+        // Only chunk truly massive strings
+        if (value.length > 100000) {
+          let result = '"';
+          for (let i = 0; i < value.length; i += 50000) {
+            const chunk = value.slice(i, Math.min(i + 50000, value.length));
+            const escaped = JSON.stringify(chunk);
+            result += escaped.slice(1, -1);
+
+            if (i % 500000 === 0 && i > 0) {
+              await checkAndYield();
+            }
+          }
+          result += '"';
+          return result;
+        }
+      }
+      return JSON.stringify(value);
+    }
+
+    if (visited.has(value)) return '"[Circular]"';
+    visited.add(value);
+
+    // Optimization: Use native JSON.stringify for small, safe objects
+    if (isSafeObject(value)) {
+      operations += 10; // Count as multiple operations
+      return JSON.stringify(value);
+    }
+
+    // Check yield at start of complex objects
+    await checkAndYield();
+
+    if (Array.isArray(value)) {
+      const parts = [];
+
+      // Process array in batches
+      for (let i = 0; i < value.length; i += BATCH_SIZE) {
+        const batch = value.slice(i, Math.min(i + BATCH_SIZE, value.length));
+
+        // Process batch
+        for (const item of batch) {
+          parts.push(await stringify(item, visited));
+        }
+
+        // Check after each batch
+        if (i > 0 && i % (BATCH_SIZE * 10) === 0) {
+          await checkAndYield();
+        }
+      }
+
+      return '[' + parts.join(',') + ']';
+    }
+
+    // Object case - use array for string building
+    const entries = [];
+    let keyCount = 0;
+
+    for (const [key, val] of Object.entries(value)) {
+      if (val !== undefined && typeof val !== 'function') {
+        entries.push(JSON.stringify(key) + ':' + await stringify(val, visited));
+        keyCount++;
+
+        // Check after processing multiple keys
+        if (keyCount % 100 === 0) {
+          await checkAndYield();
+        }
+      }
+    }
+
+    return '{' + entries.join(',') + '}';
+  }
+
+  try {
+    const result = await stringify(obj);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (error) {
+    clearTimeout(timeoutId);
+    throw error;
+  }
+}
+
 
 // ============================================================================
 // Test Object Generator
@@ -345,6 +489,91 @@ function validateOutput(result, expected) {
 }
 
 // ============================================================================
+// Test Runner with Multiple Iterations
+// ============================================================================
+
+// Run a single test
+async function runSingleTest(name, fn, obj, timeout) {
+  const monitor = new EventLoopMonitor();
+  monitor.start();
+  const startTime = Date.now();
+
+  try {
+    const result = await fn(obj, timeout);
+    const duration = Date.now() - startTime;
+    const stats = monitor.stop();
+    return {
+      success: true,
+      duration,
+      result,
+      stats
+    };
+  } catch (error) {
+    const duration = Date.now() - startTime;
+    const stats = monitor.stop();
+    return {
+      success: false,
+      duration,
+      error: error.message,
+      stats
+    };
+  }
+}
+
+// Run multiple iterations and collect statistics
+async function runTestWithStats(name, fn, obj, timeout, referenceOutput, iterations = 5) {
+  const results = [];
+
+  console.log(`   Running ${iterations} iterations...`);
+
+  for (let i = 0; i < iterations; i++) {
+    // Small delay between runs to let system settle
+    if (i > 0) await new Promise(r => setTimeout(r, 100));
+
+    const result = await runSingleTest(name, fn, obj, timeout);
+    results.push(result);
+
+    if (result.success) {
+      process.stdout.write(`\r   Iteration ${i + 1}/${iterations}: ${result.duration}ms`);
+    }
+  }
+
+  console.log(); // New line after progress
+
+  // Calculate statistics
+  const successfulRuns = results.filter(r => r.success);
+  if (successfulRuns.length === 0) {
+    const firstError = results[0];
+    console.log(`   ❌ All iterations failed: ${firstError.error}`);
+    return null;
+  }
+
+  const times = successfulRuns.map(r => r.duration);
+  const best = Math.min(...times);
+  const worst = Math.max(...times);
+  const average = Math.round(times.reduce((a, b) => a + b, 0) / times.length);
+  const median = times.sort((a, b) => a - b)[Math.floor(times.length / 2)];
+
+  // Use the best run for validation
+  const bestRun = successfulRuns.find(r => r.duration === best);
+  const validation = validateOutput(bestRun.result, referenceOutput);
+
+  console.log(`   ✅ Completed: Best=${best}ms, Avg=${average}ms, Median=${median}ms, Worst=${worst}ms`);
+  console.log(`   Result size: ${(bestRun.result.length / 1024).toFixed(1)} KB`);
+  console.log(`   Event loop (best run): ${bestRun.stats.intervals} intervals, ${bestRun.stats.blockCount} blocks`);
+  console.log(`   Validation: ${validation.valid ? '✅ PASS' : '❌ FAIL'} (hash: ${validation.hash})`);
+
+  return {
+    best,
+    average,
+    median,
+    worst,
+    times,
+    validation
+  };
+}
+
+// ============================================================================
 // Main Benchmark
 // ============================================================================
 
@@ -399,8 +628,11 @@ async function runBenchmark() {
       console.log(`Estimated total size: ~${(sample.length * test.size / 1024).toFixed(1)} KB\n`);
     } catch (e) {}
 
-    // 1. Native JSON.stringify (baseline)
-    console.log('1. NATIVE JSON.stringify (blocking):');
+    // Number of iterations for each test
+    const ITERATIONS = 5;
+
+    // 1. Native JSON.stringify (baseline) - single run only
+    console.log('1. NATIVE JSON.stringify (blocking - single run):');
     const monitor1 = new EventLoopMonitor();
     monitor1.start();
     const t1 = Date.now();
@@ -417,104 +649,45 @@ async function runBenchmark() {
       console.log(`   ❌ Failed: ${e.message}`);
     }
 
-    // 2. Fiber-based with timeout
+    // 2. Fiber-based with timeout (multiple iterations)
     console.log('\n2. FIBER-based (with yielding):');
-    const monitor2 = new EventLoopMonitor();
-    monitor2.start();
-    const t2 = Date.now();
-
-    // Schedule the fiber operation
-    const fiberPromise = new Promise((resolve) => {
-      setTimeout(() => {
-        try {
-          runWithFiber(() => fiberStringify(obj, 5), test.timeout)
-            .then(result => {
-              const duration = Date.now() - t2;
-              const stats = monitor2.stop();
-              const validation = validateOutput(result, test.referenceOutput);
-              console.log(`   ✅ Completed in ${duration}ms (${(result.length / 1024).toFixed(1)} KB)`);
-              console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks, max ${stats.maxBlock}ms`);
-              console.log(`   Validation: ${validation.valid ? '✅ PASS' : '❌ FAIL'} (hash: ${validation.hash})`);
-              resolve();
-            })
-            .catch(error => {
-              const duration = Date.now() - t2;
-              const stats = monitor2.stop();
-              if (error.message.includes('timeout')) {
-                console.log(`   ⏱️  Timeout at ${duration}ms: ${error.message}`);
-              } else {
-                console.log(`   ❌ Error at ${duration}ms: ${error.message}`);
-              }
-              console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks`);
-              console.log(`   Note: Fiber yields but JSON.stringify with replacer is inherently slow`);
-              resolve();
-            });
-        } catch (e) {
-          monitor2.stop();
-          console.log(`   ❌ Error: ${e.message}`);
-          resolve();
-        }
-      }, 0);
-    });
-
-    await fiberPromise;
+    const fiberFn = async (obj, timeout) => {
+      return new Promise((resolve, reject) => {
+        runWithFiber(() => fiberStringify(obj, 5), timeout)
+          .then(resolve)
+          .catch(reject);
+      });
+    };
+    await runTestWithStats('Fiber', fiberFn, obj, test.timeout, test.referenceOutput, ITERATIONS);
 
     // 3. Yieldable-json library (production-ready solution)
     console.log('\n3. YIELDABLE-JSON (production library):');
-    const monitor3 = new EventLoopMonitor();
-    monitor3.start();
-    const t3 = Date.now();
-    try {
-      const result = await asyncStringifyYieldable(obj, test.timeout, 5);
-      const duration = Date.now() - t3;
-      const stats = monitor3.stop();
-      const validation = validateOutput(result, test.referenceOutput);
-      console.log(`   ✅ Completed in ${duration}ms (${(result.length / 1024).toFixed(1)} KB)`);
-      console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks, max ${stats.maxBlock}ms`);
-      console.log(`   Validation: ${validation.valid ? '✅ PASS' : '❌ FAIL'} (hash: ${validation.hash})`);
-    } catch (error) {
-      const duration = Date.now() - t3;
-      const stats = monitor3.stop();
-      console.log(`   ⏱️  Timeout at ${duration}ms: ${error.message}`);
-      console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks`);
-    }
+    await runTestWithStats('Yieldable-json', asyncStringifyYieldable, obj, test.timeout, test.referenceOutput, ITERATIONS);
 
     // 4. Custom async stringify (our implementation)
     console.log('\n4. ASYNC/AWAIT (custom stringify):');
-    const monitor4 = new EventLoopMonitor();
-    monitor4.start();
-    const t4 = Date.now();
-    try {
-      const result = await asyncStringify(obj, test.timeout, 5);
-      const duration = Date.now() - t4;
-      const stats = monitor4.stop();
-      const validation = validateOutput(result, test.referenceOutput);
-      console.log(`   ✅ Completed in ${duration}ms (${(result.length / 1024).toFixed(1)} KB)`);
-      console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks, max ${stats.maxBlock}ms`);
-      console.log(`   Validation: ${validation.valid ? '✅ PASS' : '❌ FAIL'} (hash: ${validation.hash})`);
-    } catch (error) {
-      const duration = Date.now() - t4;
-      const stats = monitor4.stop();
-      console.log(`   ⏱️  Timeout at ${duration}ms: ${error.message}`);
-      console.log(`   Event loop: ${stats.intervals} intervals, ${stats.blockCount} blocks`);
-    }
+    await runTestWithStats('Custom async', asyncStringify, obj, test.timeout, test.referenceOutput, ITERATIONS);
 
-    // 5. Demonstrate concurrent work during serialization
-    console.log('\n5. CONCURRENT WORK TEST (async approach):');
+    // 5. Optimized async stringify
+    console.log('\n5. ASYNC/AWAIT OPTIMIZED (faster version):');
+    await runTestWithStats('Optimized async', asyncStringifyOptimized, obj, test.timeout, test.referenceOutput, ITERATIONS);
+
+    // 6. Demonstrate concurrent work during serialization
+    console.log('\n6. CONCURRENT WORK TEST (optimized async):');
     let concurrentWork = 0;
     const workInterval = setInterval(() => concurrentWork++, 5);
 
-    const t5 = Date.now();
+    const t6 = Date.now();
     try {
-      await asyncStringify(obj, test.timeout * 2, 5);
+      await asyncStringifyOptimized(obj, test.timeout * 2, 5);
       clearInterval(workInterval);
-      const duration = Date.now() - t5;
+      const duration = Date.now() - t6;
       const expected = Math.floor(duration / 5);
       console.log(`   Concurrent work: ${concurrentWork}/${expected} expected iterations`);
       console.log(`   Efficiency: ${(concurrentWork / expected * 100).toFixed(1)}%`);
     } catch (e) {
       clearInterval(workInterval);
-      const duration = Date.now() - t5;
+      const duration = Date.now() - t6;
       const expected = Math.floor(duration / 5);
       console.log(`   Concurrent work: ${concurrentWork}/${expected} iterations during timeout`);
     }
@@ -580,12 +753,28 @@ async function runBenchmark() {
     console.log(`   Error: ${error.message}`);
   }
 
+  // Test Optimized Async
+  console.log('\n4. OPTIMIZED ASYNC interruption:');
+  const optimizedStart = Date.now();
+  try {
+    await asyncStringifyOptimized(massiveObj, targetTimeout, 5);
+    console.log('   ❌ Should have timed out!');
+  } catch (error) {
+    const actualTime = Date.now() - optimizedStart;
+    const difference = actualTime - targetTimeout;
+    console.log(`   ✅ Interrupted successfully`);
+    console.log(`   Target: ${targetTimeout}ms, Actual: ${actualTime}ms, Diff: ${difference >= 0 ? '+' : ''}${difference}ms`);
+    console.log(`   Error: ${error.message}`);
+  }
+
   console.log('\n' + '='.repeat(80));
   console.log('SUMMARY:');
   console.log('- Native: Fast but blocks event loop completely');
   console.log('- Fiber: Can yield but requires special runtime (deprecated)');
   console.log('- Async/await: Modern, non-blocking, timeout-capable');
-  console.log('- All approaches (Fiber, Yieldable-json, Custom Async) can be interrupted by timeout');
+  console.log('- All approaches can be interrupted by timeout');
+  console.log('- Multiple iterations provide more accurate timing measurements');
+  console.log('- Best time represents optimal performance without system noise');
   console.log('- Interruption happens within milliseconds of the target timeout');
   console.log('- Async/await allows true concurrent work during serialization');
   console.log('='.repeat(80));
