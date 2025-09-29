@@ -5,8 +5,6 @@
   "main": "benchmark.js",
   "scripts": {
     "benchmark": "node --max-old-space-size=4096 benchmark.js",
-    "benchmark:async": "node --max-old-space-size=4096 benchmark-async-only.js",
-    "demo:timeout": "node timeout-demo.js",
     "test": "npm run benchmark"
   },
   "keywords": [

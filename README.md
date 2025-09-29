@@ -30,11 +30,8 @@ npm install --production
 # Full comparison (requires Node.js 14 with fibers)
 npm run benchmark
 
-# Async-only tests (any Node.js version)
-npm run benchmark:async
-
-# Timeout demonstration
-npm run demo:timeout
+# Or directly:
+node --max-old-space-size=4096 benchmark.js
 ```
 
 ## Migration Guide
@@ -140,10 +137,9 @@ Size: 10000, Timeout: 5000ms
 
 ## Files
 
-- `benchmark.js` - Full comparison of all approaches
-- `benchmark-async-only.js` - Async/await implementation without fiber dependency
-- `timeout-demo.js` - Clear demonstration of timeout interruption
-- `migration-example.js` - Side-by-side comparison of both approaches
+- `benchmark.js` - Full comparison of all approaches with timeout and interruption tests
+- `package.json` - Dependencies and scripts
+- `.gitignore` - Git ignore configuration
 
 ## License
 
