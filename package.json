@@ -1,0 +1,32 @@
+{
+  "name": "json-benchmark-fibers-to-async",
+  "version": "1.0.0",
+  "description": "Benchmark demonstrating migration from fiber-based to async/await JSON serialization",
+  "main": "benchmark.js",
+  "scripts": {
+    "benchmark": "node --max-old-space-size=4096 benchmark.js",
+    "benchmark:async": "node --max-old-space-size=4096 benchmark-async-only.js",
+    "demo:timeout": "node timeout-demo.js",
+    "test": "npm run benchmark"
+  },
+  "keywords": [
+    "json",
+    "serialization",
+    "async",
+    "fibers",
+    "non-blocking",
+    "benchmark"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "everything-json": "^1.2.1",
+    "yieldable-json": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "optionalDependencies": {
+    "fibers": "^5.0.3"
+  }
+}
